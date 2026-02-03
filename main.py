@@ -11,19 +11,22 @@ from pdf2image import convert_from_bytes
 from docx import Document
 
 # --- CONFIGURATION ---
-# We check if we are on Windows. If yes, use local paths. 
-# If on Linux (Render), we skip this and let it find the tools automatically.
+# 1. Detect Environment (Windows vs Linux)
+# This prevents the "File Not Found" crash on Render
 if platform.system() == "Windows":
+    # Local Windows Paths (Your Laptop)
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
     POPPLER_PATH = r'C:\Program Files\poppler-25.12.0\Library\bin'
 else:
-    POPPLER_PATH = None # Linux finds it automatically
+    # Linux Paths (Render Cloud) - Finds tools automatically
+    POPPLER_PATH = None 
 
 app = FastAPI()
 
+# 2. CORS (Allow Vercel Frontend to talk to Backend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # In production, you can replace "*" with your Vercel URL
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -32,7 +35,7 @@ class ImagePayload(BaseModel):
     image: str
     filter_type: str = "scan" 
 
-# --- CV LOGIC ---
+# --- CV LOGIC (Computer Vision) ---
 
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
@@ -54,16 +57,19 @@ def four_point_transform(image, pts):
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
 def process_image_logic(image, filter_type="scan"):
+    # Resize for detection (speed optimization)
     ratio = image.shape[0] / 500.0
     orig = image.copy()
     image_small = cv2.resize(image, (int(image.shape[1] / ratio), 500))
 
+    # Edge Detection
     gray = cv2.cvtColor(image_small, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(gray, 75, 200)
     kernel = np.ones((5,5), np.uint8)
     edged = cv2.dilate(edged, kernel, iterations=1)
 
+    # Find Contours
     cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
     screenCnt = None
@@ -74,11 +80,13 @@ def process_image_logic(image, filter_type="scan"):
             screenCnt = approx
             break
 
+    # Apply Transform
     if screenCnt is not None and filter_type != "photo":
         warped = four_point_transform(orig, screenCnt.reshape(4, 2) * ratio)
     else:
         warped = orig
 
+    # Apply Filters
     if filter_type == "bw":
         warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         warped = cv2.threshold(warped, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
@@ -94,9 +102,14 @@ def process_image_logic(image, filter_type="scan"):
 
     return warped
 
+@app.get("/")
+def health_check():
+    return {"status": "Online", "message": "Backend is running smoothly!"}
+
 @app.post("/process")
 async def process_document(payload: ImagePayload):
     try:
+        # 1. Decode Base64 Image
         if "," in payload.image:
             header, encoded = payload.image.split(",", 1)
         else:
@@ -104,37 +117,57 @@ async def process_document(payload: ImagePayload):
             
         file_bytes = base64.b64decode(encoded)
         
-        # Determine Source Type
+        # 2. Determine File Type & Load Image
         if "application/pdf" in header:
-            # FIX: Only pass poppler_path if on Windows (not None)
+            # Uses safe Poppler path based on Windows/Linux check
             if POPPLER_PATH:
                  images = convert_from_bytes(file_bytes, poppler_path=POPPLER_PATH)
             else:
-                 images = convert_from_bytes(file_bytes) # Linux uses default path
+                 images = convert_from_bytes(file_bytes)
             
             if len(images) > 0:
                 img = np.array(images[0])[:, :, ::-1].copy()
+            else:
+                raise Exception("Empty PDF")
+
         elif "officedocument" in header:
+            # Handle DOCX
             doc = Document(io.BytesIO(file_bytes))
             text = "\n".join([p.text for p in doc.paragraphs])
             blank = np.zeros((800, 600, 3), np.uint8) + 255
             cv2.putText(blank, "DOCX Text Extracted", (50, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2)
             _, buf = cv2.imencode('.jpg', blank)
             return {"status": "success", "scanned_image": f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}", "text": text}
+
         elif "text/plain" in header:
+            # Handle Text Files
             text = file_bytes.decode("utf-8")
             blank = np.zeros((800, 600, 3), np.uint8) + 255
             _, buf = cv2.imencode('.jpg', blank)
             return {"status": "success", "scanned_image": f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}", "text": text}
+
         else:
+            # Handle Standard Images (JPG, PNG)
             nparr = np.frombuffer(file_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+        # 3. RAM SAVER: Resize if huge
+        # Prevents Server Freezing on Render Free Tier
+        height, width = img.shape[:2]
+        max_dim = 1500
+        if width > max_dim or height > max_dim:
+            scaling_factor = max_dim / float(max(width, height))
+            img = cv2.resize(img, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
+
+        # 4. Run Processing Pipeline
         processed = process_image_logic(img, payload.filter_type)
         
+        # 5. Run OCR (Text Extraction)
+        # Use gray version for faster OCR
         gray_for_ocr = processed if len(processed.shape) == 2 else cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
         text = pytesseract.image_to_string(gray_for_ocr)
 
+        # 6. Encode Result
         _, buffer = cv2.imencode('.jpg', processed)
         processed_base64 = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode()}"
 
