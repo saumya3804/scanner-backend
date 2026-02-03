@@ -3,21 +3,14 @@ import numpy as np
 import base64
 import pytesseract
 import io
-import platform
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from pdf2image import convert_from_bytes
 from docx import Document
 
-# --- CONFIGURATION ---
-# We check if we are on Windows. If yes, use local paths. 
-# If on Linux (Render), we skip this and let it find the tools automatically.
-if platform.system() == "Windows":
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    POPPLER_PATH = r'C:\Program Files\poppler-25.12.0\Library\bin'
-else:
-    POPPLER_PATH = None 
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+POPPLER_PATH = r'C:\Program Files\poppler-25.12.0\Library\bin'
 
 app = FastAPI()
 
@@ -30,7 +23,7 @@ app.add_middleware(
 
 class ImagePayload(BaseModel):
     image: str
-    filter_type: str = "scan" 
+    filter_type: str = "scan" # Options: 'scan', 'bw', 'photo', 'enhance'
 
 # --- CV LOGIC ---
 
@@ -54,16 +47,19 @@ def four_point_transform(image, pts):
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
 def process_image_logic(image, filter_type="scan"):
+    # 1. Resize for detection
     ratio = image.shape[0] / 500.0
     orig = image.copy()
     image_small = cv2.resize(image, (int(image.shape[1] / ratio), 500))
 
+    # 2. Edge Detection
     gray = cv2.cvtColor(image_small, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(gray, 75, 200)
     kernel = np.ones((5,5), np.uint8)
     edged = cv2.dilate(edged, kernel, iterations=1)
 
+    # 3. Find Contours
     cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
     screenCnt = None
@@ -74,24 +70,32 @@ def process_image_logic(image, filter_type="scan"):
             screenCnt = approx
             break
 
+    # 4. Warp (Perspective Transform)
     if screenCnt is not None and filter_type != "photo":
         warped = four_point_transform(orig, screenCnt.reshape(4, 2) * ratio)
     else:
         warped = orig
 
+    # 5. Apply Filters
     if filter_type == "bw":
+        # Pure Black & White (Binary)
         warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         warped = cv2.threshold(warped, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    
     elif filter_type == "scan":
+        # Scanner Look (Adaptive Threshold)
         if len(warped.shape) == 3: warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         warped = cv2.adaptiveThreshold(warped, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 10)
+
     elif filter_type == "enhance":
+        # Magic Color (Sharpen + Saturation)
         kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
         warped = cv2.filter2D(warped, -1, kernel)
         warped = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-        warped[:, :, 1] = cv2.multiply(warped[:, :, 1], 1.2)
+        warped[:, :, 1] = cv2.multiply(warped[:, :, 1], 1.2) # Boost saturation
         warped = cv2.cvtColor(warped, cv2.COLOR_HSV2BGR)
 
+    # For Photo mode, return original warped images
     return warped
 
 @app.post("/process")
@@ -106,15 +110,13 @@ async def process_document(payload: ImagePayload):
         
         # Determine Source Type
         if "application/pdf" in header:
-            # FIX: Only pass poppler_path if on Windows (not None)
-            if POPPLER_PATH:
-                 images = convert_from_bytes(file_bytes, poppler_path=POPPLER_PATH)
-            else:
-                 images = convert_from_bytes(file_bytes) # Linux uses default path
-            
+            # Note: Add poppler_path here if needed
+            images = convert_from_bytes(file_bytes,
+                                        poppler_path=POPPLER_PATH) 
             if len(images) > 0:
                 img = np.array(images[0])[:, :, ::-1].copy()
         elif "officedocument" in header:
+            # Handle DOCX (return text only, dummy image)
             doc = Document(io.BytesIO(file_bytes))
             text = "\n".join([p.text for p in doc.paragraphs])
             blank = np.zeros((800, 600, 3), np.uint8) + 255
@@ -127,14 +129,18 @@ async def process_document(payload: ImagePayload):
             _, buf = cv2.imencode('.jpg', blank)
             return {"status": "success", "scanned_image": f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}", "text": text}
         else:
+            # Standard Image
             nparr = np.frombuffer(file_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+        # Run Pipeline
         processed = process_image_logic(img, payload.filter_type)
         
+        # Run OCR (on grayscale version for speed)
         gray_for_ocr = processed if len(processed.shape) == 2 else cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
         text = pytesseract.image_to_string(gray_for_ocr)
 
+        # Encode Response
         _, buffer = cv2.imencode('.jpg', processed)
         processed_base64 = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode()}"
 
@@ -145,7 +151,7 @@ async def process_document(payload: ImagePayload):
         }
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
